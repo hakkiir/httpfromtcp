@@ -2,14 +2,21 @@ package request
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
+
+	"github.com/hakkiir/httpfromtcp/internal/headers"
 )
 
 type Request struct {
 	RequestLine RequestLine
+	State       ParserState
+	Headers     headers.Headers
+	Body        []byte
 }
 
 type RequestLine struct {
@@ -20,35 +27,65 @@ type RequestLine struct {
 
 const crlf = "\r\n"
 
+type ParserState int
+
+const (
+	requestStateInitialized ParserState = iota
+	requestStateDone
+	requestStateParsingHeaders
+	requestStateParsingBody
+)
+const bufferSize = 8
+
 func RequestFromReader(reader io.Reader) (*Request, error) {
-
-	req, err := io.ReadAll(reader)
-	if err != nil {
-		return nil, err
+	buf := make([]byte, bufferSize, bufferSize)
+	readToIndex := 0
+	req := &Request{
+		State:   requestStateInitialized,
+		Headers: make(headers.Headers),
 	}
+	for req.State != requestStateDone {
+		if readToIndex >= len(buf) {
+			newBuf := make([]byte, len(buf)*2)
+			copy(newBuf, buf)
+			buf = newBuf
+		}
 
-	requestLine, err := parseRequestLine(req)
-	if err != nil {
-		return nil, err
+		numBytesRead, err := reader.Read(buf[readToIndex:])
+		if err != nil {
+			if errors.Is(io.EOF, err) {
+				if req.State != requestStateDone {
+					return nil, fmt.Errorf("incomplete request, in state: %d, read n bytes on EOF: %d", req.State, numBytesRead)
+				}
+				break
+			}
+			return nil, err
+		}
+		readToIndex += numBytesRead
+
+		numBytesParsed, err := req.parse(buf[:readToIndex])
+		if err != nil {
+			return nil, err
+		}
+
+		copy(buf, buf[numBytesParsed:])
+		readToIndex -= numBytesParsed
 	}
-	return &Request{
-		RequestLine: *requestLine,
-	}, err
-
+	return req, nil
 }
 
-func parseRequestLine(data []byte) (*RequestLine, error) {
+func parseRequestLine(data []byte) (numBytes int, rl *RequestLine, err error) {
 	index := bytes.Index(data, []byte(crlf))
 	if index == -1 {
-		return nil, fmt.Errorf("could not find CRLF in request line")
+		return 0, nil, nil
 	}
 	reqLineStr := string(data[:index])
 	requestLine, err := requestLineFromString(reqLineStr)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 
-	return requestLine, nil
+	return index + 2, requestLine, nil
 }
 
 func requestLineFromString(str string) (*RequestLine, error) {
@@ -87,4 +124,71 @@ func requestLineFromString(str string) (*RequestLine, error) {
 		RequestTarget: requestPath,
 		Method:        method,
 	}, nil
+}
+
+func (r *Request) parse(data []byte) (int, error) {
+
+	totalBytesParsed := 0
+	for r.State != requestStateDone {
+		n, err := r.parseSingle(data[totalBytesParsed:])
+		if err != nil {
+			return 0, err
+		}
+		totalBytesParsed += n
+		if n == 0 {
+			break
+		}
+	}
+	return totalBytesParsed, nil
+}
+
+func (r *Request) parseSingle(data []byte) (int, error) {
+	switch r.State {
+	case requestStateInitialized:
+		numBytes, requestLine, err := parseRequestLine(data)
+		if err != nil {
+			return 0, err
+		}
+		if numBytes == 0 {
+			return 0, nil
+		}
+		r.RequestLine = *requestLine
+		r.State = requestStateParsingHeaders
+		return numBytes, nil
+
+	case requestStateParsingHeaders:
+		n, done, err := r.Headers.Parse(data)
+		if err != nil {
+			return 0, err
+		}
+		if done {
+			r.State = requestStateParsingBody
+		}
+		return n, nil
+
+	case requestStateParsingBody:
+		val := r.Headers.Get("Content-Length")
+		if val == "" {
+			r.State = requestStateDone
+			return 0, nil
+		}
+		contentLen, err := strconv.Atoi(val)
+		if err != nil {
+			return 0, err
+		}
+		r.Body = append(r.Body, data...)
+		if len(r.Body) > contentLen {
+			return 0, fmt.Errorf("too long content")
+		}
+		if contentLen == len(r.Body) {
+			r.State = requestStateDone
+		}
+		return len(data), nil
+
+	case requestStateDone:
+		return 0, fmt.Errorf("error: trying to read data in done state")
+
+	default:
+		return 0, fmt.Errorf("unknown state")
+	}
 }
